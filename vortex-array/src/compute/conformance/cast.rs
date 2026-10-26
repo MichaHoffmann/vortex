@@ -40,6 +40,11 @@ fn cast_and_execute(
 /// - Casting with nullability changes
 /// - Casting between string types (Utf8/Binary)
 /// - Edge cases like overflow behavior
+///
+/// An encoding that supports nullable dtypes **must** also pass a partially valid array, which
+/// checks the nullability contract of [`CastReduce`].
+///
+/// [`CastReduce`]: crate::scalar_fn::fns::cast::CastReduce
 pub fn test_cast_conformance(array: &ArrayRef, ctx: &mut ExecutionCtx) {
     let dtype = array.dtype();
 
