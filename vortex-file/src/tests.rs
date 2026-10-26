@@ -21,6 +21,9 @@ use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::AggregateFnRef;
+use vortex_array::aggregate_fn::AggregateFnVTableExt;
+use vortex_array::aggregate_fn::NumericalAggregateOpts;
+use vortex_array::aggregate_fn::fns::sum_v2::SumV2;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::ConstantArray;
@@ -2285,6 +2288,34 @@ async fn unreadable_file_statistics_do_not_fail_the_open() -> VortexResult<()> {
     assert!(file.file_stats().is_none());
     let actual = file.scan()?.into_array_stream()?.read_all().await?;
     assert_arrays_eq!(actual, array, &mut SESSION.create_execution_ctx());
+    Ok(())
+}
+
+#[tokio::test]
+async fn file_data_source_returns_mergeable_partials() -> VortexResult<()> {
+    let sum = SumV2.bind(NumericalAggregateOpts::default());
+    let array =
+        StructArray::from_fields(&[("numbers", buffer![1_i32, 2, 3].into_array())])?.into_array();
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .disable_editions()
+        .with_file_statistics(vec![sum.clone()])
+        .write(&mut buf, array.to_array_stream())
+        .await?;
+    let source = SESSION.open_options().open_buffer(buf)?.data_source()?;
+    let partial = source
+        .field_statistic(&field_path!(numbers), &sum)
+        .await?
+        .as_exact()
+        .expect("stored partial");
+    let mut accumulator = sum.accumulator(&I32.into())?;
+    accumulator.combine_partials(&partial)?;
+    accumulator.combine_partials(&partial)?;
+    assert_eq!(
+        accumulator.final_scalar()?,
+        Scalar::primitive(12_i64, Nullability::Nullable)
+    );
     Ok(())
 }
 
