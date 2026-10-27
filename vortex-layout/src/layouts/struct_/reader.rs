@@ -755,6 +755,7 @@ mod tests {
     use vortex_array::expr::is_not_null;
     use vortex_array::expr::is_null;
     use vortex_array::expr::lit;
+    use vortex_array::expr::lt;
     use vortex_array::expr::not;
     use vortex_array::expr::or;
     use vortex_array::expr::pack;
@@ -1900,8 +1901,8 @@ mod tests {
         [true, true, true],
     )]
     #[case::nullable_and(
-        and(gt(col("a"), lit(1)), gt(col("c"), lit(3))),
-        [false, true, true],
+        and(lt(col("a"), lit(2)), gt(col("c"), lit(3))),
+        [false, true, false],
     )]
     #[case::nullable_or(
         or(gt(col("a"), lit(2)), gt(col("c"), lit(4))),
