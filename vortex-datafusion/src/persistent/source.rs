@@ -375,6 +375,7 @@ impl VortexSource {
             has_output_ordering: !base_config.output_ordering.is_empty() || self.ordered,
             expression_converter: Arc::clone(&self.expression_converter),
             file_metadata_cache: self.file_metadata_cache.clone(),
+            footer_initial_read_size_bytes: self.options.footer_initial_read_size_bytes,
             projection_pushdown: self.options.projection_pushdown,
             scan_concurrency: self.options.scan_concurrency,
             scan_v2: self.options.scan_v2,
