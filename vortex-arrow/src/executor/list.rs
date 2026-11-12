@@ -16,6 +16,7 @@ use vortex_array::arrays::ListArray;
 use vortex_array::arrays::ListView;
 use vortex_array::arrays::ListViewArray;
 use vortex_array::arrays::list::ListArraySlotsExt;
+use vortex_array::arrays::listview::DEFAULT_TRIM_ELEMENTS_THRESHOLD;
 use vortex_array::arrays::listview::ListViewArraySlotsExt;
 use vortex_array::arrays::listview::ListViewDataParts;
 use vortex_array::arrays::listview::ListViewRebuildMode;
@@ -24,6 +25,7 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
 use vortex_array::matcher::Matcher;
+use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -99,12 +101,37 @@ fn list_to_list<O: OffsetSizeTrait + NativePType>(
         .into_primitive()
         .to_buffer::<O>();
 
+    // Slicing a list narrows its offsets but keeps every element of the list it was sliced
+    // from. Reclaim the unreferenced leading and trailing elements before handing the array to
+    // Arrow, as the list-view export does: otherwise exporting a slice converts, and downstream
+    // consumers hold, everything its parent holds. The trim is a lazy `elements` slice plus an
+    // `O(num_lists)` offset adjustment, with no element data copy.
+    let n_elts = array.elements().len();
+    let start = offsets[0].as_usize();
+    let end = offsets[offsets.len() - 1].as_usize();
+    let trim = n_elts > 0
+        && (n_elts - (end - start)) as f32 / n_elts as f32 > DEFAULT_TRIM_ELEMENTS_THRESHOLD;
+    let (elements, offsets) = if trim {
+        let elements = array.elements().slice(start..end)?;
+        let offsets = if start == 0 {
+            offsets
+        } else {
+            let first = offsets[0];
+            offsets
+                .iter()
+                .map(|&offset| offset - first)
+                .collect::<Buffer<O>>()
+        };
+        (elements, offsets)
+    } else {
+        (array.elements().clone(), offsets)
+    };
+
     // SAFETY: `ListArray` guarantees its offsets are non-empty, non-negative and sorted. The
-    // checked cast keeps every value, so the order stays the same.
+    // checked cast keeps every value and subtracting the first offset keeps their order.
     let offsets = unsafe { offsets.into_arrow_offset_buffer_unchecked() };
 
-    let elements =
-        exporter.execute_arrow(array.elements().clone(), Some(elements_field.as_ref()), ctx)?;
+    let elements = exporter.execute_arrow(elements, Some(elements_field.as_ref()), ctx)?;
     vortex_ensure!(
         elements_field.is_nullable() || elements.null_count() == 0,
         "Cannot convert to non-nullable Arrow array with null elements"
@@ -265,6 +292,54 @@ mod tests {
             None,
         )?;
         assert_eq!(&expected as &dyn Array, actual.as_ref());
+        Ok(())
+    }
+
+    #[test]
+    fn sliced_list_exports_only_referenced_elements() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        // [[0, 1], [2, 3, 4], [], [5, 6, 7, 8, 9]]
+        let list = ListArray::try_new(
+            buffer![0i32, 1, 2, 3, 4, 5, 6, 7, 8, 9].into_array(),
+            buffer![0i32, 2, 5, 5, 10].into_array(),
+            Validity::NonNullable,
+            &mut ctx,
+        )?
+        .into_array();
+        let field = Arc::new(Field::new("item", DataType::Int32, false));
+        let arrow_dt = DataType::List(Arc::clone(&field));
+
+        // (rows, expected offsets, expected elements): a slice in the middle, one that keeps
+        // the first element, one that keeps the last, an empty one, and the whole list, which
+        // has nothing to trim.
+        let cases: [(std::ops::Range<usize>, Vec<i32>, Vec<i32>); 5] = [
+            (1..3, vec![0, 3, 3], vec![2, 3, 4]),
+            (0..2, vec![0, 2, 5], vec![0, 1, 2, 3, 4]),
+            (2..4, vec![0, 0, 5], vec![5, 6, 7, 8, 9]),
+            (2..2, vec![0], vec![]),
+            (
+                0..4,
+                vec![0, 2, 5, 5, 10],
+                vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            ),
+        ];
+        for (rows, offsets, elements) in cases {
+            let actual = list
+                .slice(rows.clone())?
+                .execute_arrow(Some(&arrow_dt), &mut ctx)?;
+            let actual = actual
+                .as_any()
+                .downcast_ref::<GenericListArray<i32>>()
+                .unwrap();
+            // Compare the physical parts: logical list equality would also hold for an
+            // export that kept every element of the parent.
+            assert_eq!(actual.offsets().as_ref(), offsets.as_slice(), "{rows:?}");
+            assert_eq!(
+                actual.values().to_data(),
+                Int32Array::from(elements).to_data(),
+                "{rows:?}"
+            );
+        }
         Ok(())
     }
 
@@ -471,13 +546,16 @@ mod tests {
         assert_eq!(second_vals.values(), &[4, 5, 6]);
 
         // The conversion shares the elements buffer regardless of which path resolves the
-        // Slice (revealed List or zero-copy-to-list ListView).
+        // Slice (revealed List or zero-copy-to-list ListView), starting at the first element
+        // the slice references.
         let values = arrow_list
             .values()
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!(values.values().as_ptr(), elements_ptr);
+        assert_eq!(values.values(), &[3, 4, 5, 6]);
+        // SAFETY: the elements buffer holds six values, so two past its start is in bounds.
+        assert_eq!(values.values().as_ptr(), unsafe { elements_ptr.add(2) });
         let expected = [Some(vec![3]), Some(vec![4, 5, 6])];
         assert_eq!(arrow_list.len(), expected.len());
         for (index, expected) in expected.into_iter().enumerate() {
