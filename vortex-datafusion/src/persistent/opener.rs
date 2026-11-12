@@ -138,6 +138,9 @@ pub(crate) struct VortexOpener {
     pub file_metadata_cache: Option<Arc<FileMetadataCache>>,
     /// Segment buffers each opened file keeps between the splits of its V1 scan.
     pub segment_cache: Option<MokaSegmentCache>,
+    /// The bytes read from the end of a file to parse its footer. Segments inside that read,
+    /// such as zone maps stored next to the footer, are served from it without further IO.
+    pub footer_initial_read_size_bytes: usize,
     /// Whether to enable expression pushdown into the underlying Vortex scan.
     pub projection_pushdown: bool,
     pub scan_concurrency: Option<usize>,
@@ -184,6 +187,7 @@ impl FileOpener for VortexOpener {
         let has_output_ordering = self.has_output_ordering;
         let scan_concurrency = self.scan_concurrency;
         let segment_cache = self.segment_cache.clone();
+        let footer_initial_read_size_bytes = self.footer_initial_read_size_bytes;
         let partitions = self.partitions.max(1);
         let scan_v2 = self.scan_v2;
 
@@ -238,6 +242,7 @@ impl FileOpener for VortexOpener {
 
             let mut open_opts = session
                 .open_options()
+                .with_initial_read_size(footer_initial_read_size_bytes)
                 .with_file_size(file.object_meta.size)
                 .with_metrics_registry(Arc::clone(&metrics_registry))
                 .with_labels(labels);
@@ -852,9 +857,16 @@ fn split_midpoint_to_byte(split_range: &Range<u64>, row_count: u64, total_size: 
 
 #[cfg(test)]
 mod tests {
+    use futures::future::BoxFuture;
     use std::fmt;
     use std::sync::Arc;
     use std::sync::LazyLock;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use vortex::array::buffer::BufferHandle;
+    use vortex::buffer::Alignment;
+    use vortex::error::VortexResult;
+    use vortex::io::VortexReadAt;
 
     use arrow_array::record_batch;
     use arrow_schema::Field;
@@ -912,6 +924,9 @@ mod tests {
     use crate::persistent::reader::DefaultVortexReaderFactory;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::default);
+
+    /// The footer read a file open issues unless told otherwise.
+    const DEFAULT_FOOTER_READ: u64 = 1 << 16;
 
     /// Test-only expr used to test error reporting.
     #[derive(Debug, Eq, Hash, PartialEq)]
@@ -1178,6 +1193,7 @@ mod tests {
             expression_converter: Arc::new(DefaultExpressionConverter::default()),
             file_metadata_cache: None,
             segment_cache: None,
+            footer_initial_read_size_bytes: 0,
             projection_pushdown: false,
             scan_concurrency: None,
             scan_v2: false,
@@ -1208,6 +1224,108 @@ mod tests {
         segment_cache.run_pending_tasks().await;
         assert!(segment_cache.entry_count() > 0);
         assert!(segment_cache.weighted_size() > 0);
+        Ok(())
+    }
+
+    /// How many reads a scan issued against its file, and how many bytes they asked for.
+    #[derive(Debug, Default)]
+    struct ReadLog {
+        reads: AtomicUsize,
+        bytes: AtomicUsize,
+    }
+
+    /// Records every read a scan issues against its file.
+    #[derive(Debug)]
+    struct RecordingReaderFactory {
+        inner: DefaultVortexReaderFactory,
+        reads: Arc<ReadLog>,
+    }
+
+    struct RecordingReadAt {
+        inner: Arc<dyn VortexReadAt>,
+        reads: Arc<ReadLog>,
+    }
+
+    impl VortexReaderFactory for RecordingReaderFactory {
+        fn create_reader(
+            &self,
+            file: &PartitionedFile,
+            session: &VortexSession,
+        ) -> DFResult<Arc<dyn VortexReadAt>> {
+            Ok(Arc::new(RecordingReadAt {
+                inner: self.inner.create_reader(file, session)?,
+                reads: Arc::clone(&self.reads),
+            }))
+        }
+    }
+
+    impl VortexReadAt for RecordingReadAt {
+        fn concurrency(&self) -> usize {
+            self.inner.concurrency()
+        }
+
+        fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
+            self.inner.size()
+        }
+
+        fn read_at(
+            &self,
+            offset: u64,
+            length: usize,
+            alignment: Alignment,
+        ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
+            self.reads.reads.fetch_add(1, Ordering::Relaxed);
+            self.reads.bytes.fetch_add(length, Ordering::Relaxed);
+            self.inner.read_at(offset, length, alignment)
+        }
+    }
+
+    /// The scan opens a file with the configured footer read size, so a read that covers the
+    /// whole file leaves nothing for the scan to fetch.
+    #[tokio::test]
+    async fn scan_open_uses_the_footer_initial_read_size() -> anyhow::Result<()> {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "file.vortex";
+        // Poorly compressible values, so the file is larger than the default footer read.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let values = (0..100_000)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                Some((state >> 1) as i64)
+            })
+            .collect::<Vec<_>>();
+        let batch = record_batch!(("a", Int64, values)).unwrap();
+        let data_size =
+            write_arrow_to_vortex(Arc::clone(&object_store), file_path, batch.clone()).await?;
+        assert!(data_size > 4 * DEFAULT_FOOTER_READ);
+        let table_schema = TableSchema::builder(batch.schema()).build();
+        let file = PartitionedFile::new(file_path.to_string(), data_size);
+
+        let mut reads_by_size = Vec::new();
+        for footer_initial_read_size_bytes in [0, usize::try_from(data_size)?] {
+            let reads = Arc::new(ReadLog::default());
+            let mut opener = make_opener(Arc::clone(&object_store), table_schema.clone(), None);
+            opener.vortex_reader_factory = Arc::new(RecordingReaderFactory {
+                inner: DefaultVortexReaderFactory::new(Arc::clone(&object_store)),
+                reads: Arc::clone(&reads),
+            });
+            opener.footer_initial_read_size_bytes = footer_initial_read_size_bytes;
+            let data = opener
+                .open(file.clone())?
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+            assert_eq!(concat_batches(&batch.schema(), &data)?, batch);
+            reads_by_size.push((
+                reads.reads.load(Ordering::Relaxed),
+                reads.bytes.load(Ordering::Relaxed),
+            ));
+        }
+
+        assert!(reads_by_size[0].0 > 1, "{:?}", reads_by_size[0]);
+        assert_eq!(reads_by_size[1], (1, usize::try_from(data_size)?));
         Ok(())
     }
 
@@ -1616,6 +1734,7 @@ mod tests {
             expression_converter: Arc::new(DefaultExpressionConverter::default()),
             file_metadata_cache: None,
             segment_cache: None,
+            footer_initial_read_size_bytes: 0,
             projection_pushdown: false,
             scan_concurrency: None,
             scan_v2: false,
@@ -1709,6 +1828,7 @@ mod tests {
             expression_converter: Arc::new(DefaultExpressionConverter::default()),
             file_metadata_cache: None,
             segment_cache: None,
+            footer_initial_read_size_bytes: 0,
             projection_pushdown: false,
             scan_concurrency: None,
             scan_v2: false,
@@ -1893,6 +2013,7 @@ mod tests {
             expression_converter: Arc::new(DefaultExpressionConverter::default()),
             file_metadata_cache: None,
             segment_cache: None,
+            footer_initial_read_size_bytes: 0,
             projection_pushdown: false,
             scan_concurrency: None,
             scan_v2: false,
@@ -1959,6 +2080,7 @@ mod tests {
             expression_converter: Arc::new(DefaultExpressionConverter::default()),
             file_metadata_cache: None,
             segment_cache: None,
+            footer_initial_read_size_bytes: 0,
             projection_pushdown: false,
             scan_concurrency: None,
             scan_v2: false,
@@ -2176,6 +2298,7 @@ mod tests {
             expression_converter: Arc::new(DefaultExpressionConverter::default()),
             file_metadata_cache: None,
             segment_cache: None,
+            footer_initial_read_size_bytes: 0,
             projection_pushdown: false,
             scan_concurrency: None,
             scan_v2: false,
