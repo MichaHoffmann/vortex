@@ -35,6 +35,7 @@ use object_store::path::Path;
 use vortex::file::VORTEX_FILE_EXTENSION;
 use vortex::layout::LayoutReader;
 use vortex::layout::scan::v2::WeakScanCache;
+use vortex::layout::segments::MokaSegmentCache;
 use vortex::layout::segments::SegmentSource;
 use vortex::metrics::DefaultMetricsRegistry;
 use vortex::metrics::MetricsRegistry;
@@ -214,6 +215,8 @@ pub struct VortexSource {
     pub(crate) ordered: bool,
     vx_metrics_registry: Arc<dyn MetricsRegistry>,
     file_metadata_cache: Option<Arc<FileMetadataCache>>,
+    /// Segment buffers the files of this source's V1 scans keep between their splits.
+    segment_cache: Option<MokaSegmentCache>,
     /// Options controlling scan planning and execution behavior.
     options: VortexTableOptions,
 }
@@ -249,6 +252,7 @@ impl VortexSource {
             vortex_reader_factory: None,
             vx_metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             file_metadata_cache: None,
+            segment_cache: None,
             ordered: false,
             options: VortexTableOptions::default(),
         }
@@ -315,6 +319,20 @@ impl VortexSource {
         self
     }
 
+    /// Keeps the segments this source's V1 scans read in `segment_cache`.
+    ///
+    /// A V1 scan reads a file in splits. A stored segment that several splits need is shared
+    /// only while its read is in flight, so a split that starts after its neighbour finished
+    /// reads the segment again. A few megabytes per file being scanned are enough to read
+    /// such segments once.
+    ///
+    /// Files share the cache, each under an ID derived from its location, size, modification
+    /// time and entity tag. A V2 scan retains segments on its own and gains nothing from this.
+    pub fn with_segment_cache(mut self, segment_cache: MokaSegmentCache) -> Self {
+        self.segment_cache = Some(segment_cache);
+        self
+    }
+
     /// Sets the per-file Vortex scan concurrency.
     ///
     /// This is separate from DataFusion's partition-level parallelism.
@@ -375,6 +393,7 @@ impl VortexSource {
             has_output_ordering: !base_config.output_ordering.is_empty() || self.ordered,
             expression_converter: Arc::clone(&self.expression_converter),
             file_metadata_cache: self.file_metadata_cache.clone(),
+            segment_cache: self.segment_cache.clone(),
             projection_pushdown: self.options.projection_pushdown,
             scan_concurrency: self.options.scan_concurrency,
             scan_v2: self.options.scan_v2,

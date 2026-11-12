@@ -45,6 +45,7 @@ use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream;
+use object_store::ObjectMeta;
 use object_store::path::Path;
 use tracing::Instrument;
 use vortex::array::VortexSessionExecute;
@@ -62,7 +63,9 @@ use vortex::layout::scan::v2::ScanBuilder as V2ScanBuilder;
 use vortex::layout::scan::v2::ScanCache;
 use vortex::layout::scan::v2::WeakScanCache;
 use vortex::layout::scan::v2::partition_row_range;
+use vortex::layout::segments::MokaSegmentCache;
 use vortex::layout::segments::SegmentSource;
+use vortex::layout::segments::SegmentSourceId;
 use vortex::mask::Mask;
 use vortex::metrics::Label;
 use vortex::metrics::MetricsRegistry;
@@ -133,6 +136,8 @@ pub(crate) struct VortexOpener {
 
     pub expression_converter: Arc<dyn ExpressionConverter>,
     pub file_metadata_cache: Option<Arc<FileMetadataCache>>,
+    /// Segment buffers each opened file keeps between the splits of its V1 scan.
+    pub segment_cache: Option<MokaSegmentCache>,
     /// Whether to enable expression pushdown into the underlying Vortex scan.
     pub projection_pushdown: bool,
     pub scan_concurrency: Option<usize>,
@@ -178,6 +183,7 @@ impl FileOpener for VortexOpener {
         let file_schemas = Arc::clone(&self.file_schemas);
         let has_output_ordering = self.has_output_ordering;
         let scan_concurrency = self.scan_concurrency;
+        let segment_cache = self.segment_cache.clone();
         let partitions = self.partitions.max(1);
         let scan_v2 = self.scan_v2;
 
@@ -251,6 +257,11 @@ impl FileOpener for VortexOpener {
 
             if let Some(footer) = cached_footer {
                 open_opts = open_opts.with_footer(footer);
+            }
+            if let Some(segment_cache) = &segment_cache {
+                let source_id = segment_source_id(&file.object_meta);
+                open_opts =
+                    open_opts.with_segment_cache(Arc::new(segment_cache.for_file(source_id)));
             }
 
             let vxf = open_opts
@@ -695,6 +706,18 @@ fn contains_lambda(projection: &ProjectionExprs) -> DFResult<bool> {
 
 /// Returns the scan cache other partitions of `path` are planning with, or registers a new one.
 /// A scan holds its cache until its stream ends, so the cache lives as long as one scan.
+/// Identifies a file's contents in a segment cache that many files share. The location alone
+/// would let a rewritten file serve the segments of the file it replaced.
+fn segment_source_id(meta: &ObjectMeta) -> SegmentSourceId {
+    SegmentSourceId::new(format!(
+        "{}:{}:{}:{}",
+        meta.location,
+        meta.size,
+        meta.last_modified.timestamp_micros(),
+        meta.e_tag.as_deref().unwrap_or_default(),
+    ))
+}
+
 fn shared_scan_cache(scan_caches: &DashMap<Path, WeakScanCache>, path: &Path) -> ScanCache {
     match scan_caches.entry(path.clone()) {
         Entry::Occupied(mut entry) => {
@@ -876,6 +899,7 @@ mod tests {
     use vortex::file::WriteOptionsSessionExt;
     use vortex::io::VortexWrite;
     use vortex::io::object_store::ObjectStoreWrite;
+    use vortex::layout::segments::SegmentEviction;
     use vortex::metrics::DefaultMetricsRegistry;
     use vortex::scan::selection::Selection;
     use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
@@ -1153,10 +1177,38 @@ mod tests {
             has_output_ordering: false,
             expression_converter: Arc::new(DefaultExpressionConverter::default()),
             file_metadata_cache: None,
+            segment_cache: None,
             projection_pushdown: false,
             scan_concurrency: None,
             scan_v2: false,
         }
+    }
+
+    /// A V1 scan with a segment cache keeps the segments it read, under an ID of the file.
+    #[tokio::test]
+    async fn segment_cache_keeps_scanned_segments() -> anyhow::Result<()> {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "file.vortex";
+        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let data_size =
+            write_arrow_to_vortex(Arc::clone(&object_store), file_path, batch.clone()).await?;
+        let table_schema = TableSchema::builder(batch.schema()).build();
+        let file = PartitionedFile::new(file_path.to_string(), data_size);
+
+        let segment_cache = MokaSegmentCache::new(1 << 20, SegmentEviction::Lru);
+        let mut opener = make_opener(Arc::clone(&object_store), table_schema, None);
+        opener.segment_cache = Some(segment_cache.clone());
+        let data = opener
+            .open(file.clone())?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(concat_batches(&batch.schema(), &data)?, batch);
+
+        segment_cache.run_pending_tasks().await;
+        assert!(segment_cache.entry_count() > 0);
+        assert!(segment_cache.weighted_size() > 0);
+        Ok(())
     }
 
     #[rstest]
@@ -1563,6 +1615,7 @@ mod tests {
             has_output_ordering: false,
             expression_converter: Arc::new(DefaultExpressionConverter::default()),
             file_metadata_cache: None,
+            segment_cache: None,
             projection_pushdown: false,
             scan_concurrency: None,
             scan_v2: false,
@@ -1655,6 +1708,7 @@ mod tests {
             has_output_ordering: false,
             expression_converter: Arc::new(DefaultExpressionConverter::default()),
             file_metadata_cache: None,
+            segment_cache: None,
             projection_pushdown: false,
             scan_concurrency: None,
             scan_v2: false,
@@ -1838,6 +1892,7 @@ mod tests {
             has_output_ordering: false,
             expression_converter: Arc::new(DefaultExpressionConverter::default()),
             file_metadata_cache: None,
+            segment_cache: None,
             projection_pushdown: false,
             scan_concurrency: None,
             scan_v2: false,
@@ -1903,6 +1958,7 @@ mod tests {
             has_output_ordering: false,
             expression_converter: Arc::new(DefaultExpressionConverter::default()),
             file_metadata_cache: None,
+            segment_cache: None,
             projection_pushdown: false,
             scan_concurrency: None,
             scan_v2: false,
@@ -2119,6 +2175,7 @@ mod tests {
             has_output_ordering: false,
             expression_converter: Arc::new(DefaultExpressionConverter::default()),
             file_metadata_cache: None,
+            segment_cache: None,
             projection_pushdown: false,
             scan_concurrency: None,
             scan_v2: false,
